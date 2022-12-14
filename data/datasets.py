@@ -90,6 +90,9 @@ class CustomDataset(torch.utils.data.Dataset):
             poses_dir = os.path.join(root_dir, 'p3d', dataset,
                                      'poses_estimated_singletpl_perspective.bin')
         self.detections = np.load(path, allow_pickle=True)
+        # To run with partial data
+        self.detections = np.array([elem for elem in self.detections if os.path.exists(elem["image_path"])])
+        self.indices = [int(elem["image_path"].split("_")[-1].split(".")[0]) for elem in self.detections]
 
         if split == 'imagenet_test':
             aux_dataset = dataset.replace('p3d', 'imagenet')
@@ -116,7 +119,8 @@ class CustomDataset(torch.utils.data.Dataset):
             self.detections = detections_aux
 
         self.poses = torch.load(poses_dir)
-        self.detections = self.detections[self.poses['indices']]  # Pre-filter
+        # To run with partial data
+        #self.detections = self.detections[self.indices]  # Pre-filter
         if split == 'imagenet_test':
             valid_indices = valid_indices[self.poses['indices']]
             self.detections = self.detections[valid_indices]

@@ -571,7 +571,7 @@ class DiscriminatorOutput(nn.Module):
                  cmap_dim,
                  resolution,
                  img_channels,
-                 mbstd_group_size=4,
+                 mbstd_group_size=2,
                  mbstd_num_channels=1,
                  activate=True):
         super().__init__()
