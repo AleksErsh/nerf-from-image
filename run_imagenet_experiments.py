@@ -24,6 +24,7 @@ import math
 from torch.utils import tensorboard
 from torch import nn
 from tqdm import tqdm
+from glob import glob
 
 import arguments
 from data import loaders
@@ -50,6 +51,10 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
+if args.dataset == 'autodetect':
+    assert args.resume_from
+    args.dataset = loaders.autodetect_dataset(args.resume_from)
+
 print(args)
 
 experiment_name = arguments.suggest_experiment_name(args)
@@ -67,19 +72,13 @@ print('Saving tensorboard logs to', tensorboard_dir)
 print('Saving inversion reports to', report_dir)
 utils.mkdir(report_dir)
 
-if args.resume_from:
-    print('Attempting to load latest checkpoint...')
-    last_checkpoint_dir = os.path.join(args.root_path, 'gan_checkpoints',
-                                        args.resume_from,
-                                        'checkpoint_latest.pth')
+writer = None  # Instantiate later
 
-    if utils.file_exists(last_checkpoint_dir):
-        print('Resuming from manual checkpoint', last_checkpoint_dir)
-        with utils.open_file(last_checkpoint_dir, 'rb') as f:
-            resume_from = torch.load(f, map_location='cpu')
-    else:
-        raise ValueError(
-            f'Specified checkpoint {args.resume_from} does not exist!')
+gan_checkpoints_dir = os.path.join(args.root_path, 'gan_checkpoints')
+last_checkpoint_dirs = glob(os.path.join(gan_checkpoints_dir, "*"))
+gans = [dir.split("/")[-1] for dir in last_checkpoint_dirs]
+last_checkpoint_paths = [os.path.join(dir, "checkpoint_latest.pth") for dir in last_checkpoint_dirs]
+resume_from = {gan: last_checkpoint_path for gan, last_checkpoint_path in zip(gans, last_checkpoint_paths)}
 
 if args.attention_values > 0:
     color_palette = utils.get_color_palette(args.attention_values).to(device)
@@ -382,34 +381,6 @@ def create_model():
         num_classes=train_split.num_classes
         if args.use_class else None).to(device)
 
-
-if args.dual_discriminator_l1 or args.dual_discriminator_mse:
-    discriminator = None
-else:
-    discriminator = discriminator.Discriminator(
-        args.resolution,
-        nc=4 if supervise_alpha else 3,
-        dataset_config=dataset_config,
-        conditional_pose=args.conditional_pose,
-        use_encoder=args.use_encoder,
-        num_classes=train_split.num_classes if args.use_class else None,
-    ).to(device)
-discriminator_list = [discriminator]
-if args.dual_discriminator:
-    if args.use_encoder:
-        # Instantiate another discriminator
-        discriminator2 = discriminator.Discriminator(
-            args.resolution,
-            nc=4 if supervise_alpha else 3,
-            dataset_config=dataset_config,
-            conditional_pose=args.conditional_pose,
-            num_classes=train_split.num_classes if args.use_class else None,
-            use_encoder=False).to(device)
-    else:
-        discriminator2 = discriminator
-    discriminator_list.append(discriminator2)
-
-
 class ParallelModel(nn.Module):
 
     def __init__(self, resolution, model=None, model_ema=None, lpips_net=None):
@@ -470,52 +441,32 @@ class ParallelModel(nn.Module):
             return output
 
 
-if args.use_encoder or args.run_inversion:
-    loss_fn_lpips = metrics.LPIPSLoss().to(device)
-else:
-    loss_fn_lpips = None
+loss_fn_lpips = metrics.LPIPSLoss().to(device)
 
-if args.run_inversion:
-    model = None
-else:
-    model = create_model()
+model = None
 
-model_ema = create_model()
-model_ema.eval()
-model_ema.requires_grad_(False)
-if model is not None:
-    model_ema.load_state_dict(model.state_dict())
+models_ema = {}
+parallel_models = {}
+for gan in gans:
+    model_ema = create_model()
+    model_ema.eval()
+    model_ema.requires_grad_(False)
+    
+    parallel_model = nn.DataParallel(
+        ParallelModel(args.resolution,
+                    model=model,
+                    model_ema=model_ema,
+                    lpips_net=loss_fn_lpips), gpu_ids).to(device)
 
-parallel_model = nn.DataParallel(
-    ParallelModel(args.resolution,
-                  model=model,
-                  model_ema=model_ema,
-                  lpips_net=loss_fn_lpips), gpu_ids).to(device)
-parallel_discriminator_list = [
-    nn.DataParallel(d, gpu_ids) if d is not None else None
-    for d in discriminator_list
-]
+    total_params = 0
+    for param in model_ema.parameters():
+        total_params += param.numel()
+    print(f'{gan}, Params G:', total_params / 1000000, 'M')
 
-total_params = 0
-for param in model_ema.parameters():
-    total_params += param.numel()
-print('Params G:', total_params / 1000000, 'M')
-
-for d_idx, d in enumerate(discriminator_list):
-    if d is None:
-        print(f'Params D_{d_idx}: none')
-    else:
-        total_params = 0
-        for param in d.parameters():
-            total_params += param.numel()
-        print(f'Params D_{d_idx}:', total_params / 1000000, 'M')
+    models_ema[gan] = model_ema
+    parallel_models[gan] = parallel_model
 
 criterion = GANLoss()
-
-# These are set to True dynamically during runtime to optimize memory usage
-[d.requires_grad_(False) for d in discriminator_list if d is not None]
-if model is not None:
-    model.requires_grad_(False)
 
 torch.manual_seed(random_seed)
 np.random.seed(random_seed)
@@ -535,32 +486,24 @@ augment_p_effective = 0.
 ppl_running_avg = None
 
 
-if resume_from is not None:
-    print('Loading specified checkpoint...')
-    if model is not None and 'model' in resume_from:
-        model.load_state_dict(resume_from['model'])
-    model_ema.load_state_dict(resume_from['model_ema'])
-    if 'iteration' in resume_from:
-        i = resume_from['iteration']
-        print('Resuming from iteration', i)
-    else:
-        i = args.iterations
+for gan, checkpoint_path in resume_from.items():
+    print(f'Loading specified checkpoint for {gan}...')
+    with utils.open_file(checkpoint_path, 'rb') as f:
+        checkpoint = torch.load(f, map_location='cpu')
+        models_ema[gan].load_state_dict(checkpoint['model_ema'])
+        if 'iteration' in checkpoint:
+            i = checkpoint['iteration']
+            print('Resuming from iteration', i)
+        else:
+            i = args.iterations
 
-    if 'random_state' in resume_from:
-        print('Restoring RNG state...')
-        utils.restore_random_state(resume_from['random_state'], train_sampler,
-                                   rng, gpu_ids)
+        if 'random_state' in checkpoint:
+            print('Restoring RNG state...')
+            utils.restore_random_state(checkpoint['random_state'], train_sampler,
+                                    rng, gpu_ids)
 
-    if 'lr_g' in resume_from:
-        lr_g = resume_from['lr_g']
-    if 'lr_d' in resume_from:
-        lr_d = resume_from['lr_d']
-    if 'best_fid' in resume_from:
-        best_fid = resume_from['best_fid']
-    if 'augment_p_effective' in resume_from:
-        augment_p_effective = resume_from['augment_p']
-    if args.path_length_regularization and 'ppl_running_avg' in resume_from:
-        ppl_running_avg = resume_from['ppl_running_avg']
+        if args.path_length_regularization and 'ppl_running_avg' in checkpoint:
+            ppl_running_avg = checkpoint['ppl_running_avg']
 
 def estimate_poses_batch(target_coords, target_mask, focal_guesses):
     target_mask = target_mask > 0.9
@@ -608,22 +551,12 @@ if args.run_inversion:
 
     batch_size = args.batch_size // 4 * len(gpu_ids)
 
-    if args.dataset == 'p3d_car' and use_testset:
-        split_str = 'imagenettest' if args.inv_use_imagenet_testset else 'test'
-    else:
-        split_str = 'test' if use_testset else 'train'
-    if args.inv_use_separate:
-        mode_str = '_separate'
-    else:
-        mode_str = '_joint'
-    if no_optimize_pose:
-        mode_str += '_nooptpose'
-    else:
-        mode_str += '_optpose'
+    split_str = 'test' if use_testset else 'train'
+    mode_str = '_joint'
+    mode_str += '_optpose'
     w_split_str = 'nosplit' if inv_no_split else 'split'
     cfg_xid = f'_{args.xid}' if len(args.xid) > 0 else ''
     cfg_string = f'i{cfg_xid}_{split_str}{mode_str}_{loss_to_use}_gain{lr_gain_z}_{w_split_str}'
-    cfg_string += f'_it{resume_from["iteration"]}'
 
     print('Config string:', cfg_string)
 
@@ -633,23 +566,33 @@ if args.run_inversion:
     utils.mkdir(report_dir_effective)
     writer = tensorboard.SummaryWriter(report_dir_effective)
 
-    print('Resuming from pose regressor', args.coord_resume_from)
-    coord_regressor = encoder.BootstrapEncoder(
-        args.latent_dim,
-        pose_regressor=use_pose_regressor,
-        latent_regressor=use_latent_regressor,
-        separate_backbones=args.inv_use_separate,
-        pretrained=False).to(device)
+    encoders_checkpoints_dir = os.path.join(args.root_path, 'coords_checkpoints')
+    last_checkpoint_dirs = glob(os.path.join(encoders_checkpoints_dir, "*"))
+    last_checkpoint_dirs = [dir for dir in last_checkpoint_dirs if os.path.isdir(dir)]
+    encoders = [dir.split("/")[-1] for dir in last_checkpoint_dirs]
+    last_checkpoint_paths = [glob(os.path.join(dir, "*"))[0] for dir in last_checkpoint_dirs]
+    encoders_checkpoint_paths = {
+        enc: last_checkpoint_path for enc, last_checkpoint_path
+        in zip(encoders, last_checkpoint_paths)
+    }
 
-    coord_regressor = nn.DataParallel(coord_regressor, gpu_ids)
-    checkpoint_path = os.path.join(args.root_path, 'coords_checkpoints',
-                                    args.resume_from,
-                                    f'{args.coord_resume_from}.pth')
-    with utils.open_file(checkpoint_path, 'rb') as f:
-        coord_regressor.load_state_dict(
-            torch.load(f, map_location='cpu')['model_coord'])
-    coord_regressor.requires_grad_(False)
-    coord_regressor.eval()
+    coord_regressors = {}
+    for enc, checkpoint_path in encoders_checkpoint_paths.items():
+        print(f'Resuming pose regressor {enc}', checkpoint_path)
+        coord_regressor = encoder.BootstrapEncoder(
+            args.latent_dim,
+            pose_regressor=use_pose_regressor,
+            latent_regressor=use_latent_regressor,
+            separate_backbones=args.inv_use_separate,
+            pretrained=False).to(device)
+
+        coord_regressor = nn.DataParallel(coord_regressor, gpu_ids)
+        with utils.open_file(checkpoint_path, 'rb') as f:
+            coord_regressor.load_state_dict(
+                torch.load(f, map_location='cpu')['model_coord'])
+        coord_regressor.requires_grad_(False)
+        coord_regressor.eval()
+        coord_regressors[enc] = coord_regressor
 
     focal_guesses = pose_estimation.get_focal_guesses(
         train_split.focal_length)
@@ -684,9 +627,6 @@ if args.run_inversion:
         } for step in checkpoint_steps
     }
 
-    with torch.no_grad():
-        z_avg = model_ema.mapping_network.get_average_w()
-
     idx = 0
     test_bs = batch_size
 
@@ -720,8 +660,6 @@ if args.run_inversion:
             target_center = None
             target_bbox = None
             views_per_object = dataset_config['views_per_object_test']
-            if views_per_object > 1:
-                target_img_fid_random_ = test_split[target_img_idx_perm].images
 
             if use_pose_regressor:
                 target_center_fid = None
@@ -730,11 +668,6 @@ if args.run_inversion:
                 target_center_fid = test_split[target_img_idx].center
                 target_bbox_fid = test_split[target_img_idx].bbox
 
-            target_tform_cam2world_perm = test_split[
-                target_img_idx_perm].tform_cam2world
-            target_focal_perm = test_split[target_img_idx_perm].focal_length
-            target_center_perm = test_split[target_img_idx_perm].center
-            target_bbox_perm = test_split[target_img_idx_perm].bbox
         else:
             target_img = train_split[target_img_idx].images
             views_per_object = dataset_config['views_per_object']
@@ -749,39 +682,33 @@ if args.run_inversion:
             target_center_fid = train_eval_split[target_img_idx].center
             target_bbox_fid = train_eval_split[target_img_idx].bbox
 
-            target_tform_cam2world_perm = train_eval_split[
-                target_img_idx_perm].tform_cam2world
-            target_focal_perm = train_eval_split[
-                target_img_idx_perm].focal_length
-            target_center_perm = train_eval_split[target_img_idx_perm].center
-            target_bbox_perm = train_eval_split[target_img_idx_perm].bbox
-
         gt_cam2world_mat = target_tform_cam2world.clone()
-        z_ = z_avg.clone().expand(test_bs, -1, -1).contiguous()
 
-        with torch.no_grad():
-            coord_regressor_img = target_img[..., :3].permute(0, 3, 1, 2)
-            if test_bs == 1:
-                target_coords, target_mask, target_w = coord_regressor.module(
-                    coord_regressor_img)
-            else:
-                target_coords, target_mask, target_w = coord_regressor(
-                    coord_regressor_img)
-        if use_pose_regressor:
-            assert target_coords is not None
-            estimated_cam2world_mat, estimated_focal, _ = estimate_poses_batch(
-                target_coords, target_mask, focal_guesses)
-            target_tform_cam2world = estimated_cam2world_mat
-            target_focal = estimated_focal
+        plt.imshow(target_img[0][:,:,:3].cpu())
+        plt.savefig(f"target.png")
 
-        assert target_w is not None
-        z_.data[:] = target_w
+        z = {}
+        for enc, coord_regressor in coord_regressors.items():
+            with torch.no_grad():
+                coord_regressor_img = target_img[..., :3].permute(0, 3, 1, 2)
+                if test_bs == 1:
+                    target_coords, target_mask, target_w = coord_regressor.module(
+                        coord_regressor_img)
+                else:
+                    target_coords, target_mask, target_w = coord_regressor(
+                        coord_regressor_img)
+            #if use_pose_regressor:
+            #    assert target_coords is not None
+            #    estimated_cam2world_mat, estimated_focal, _ = estimate_poses_batch(
+            #        target_coords, target_mask, focal_guesses)
+            #    target_tform_cam2world = estimated_cam2world_mat
+            #    target_focal = estimated_focal
+            assert target_w is not None
+            z_ = target_w
 
-        if inv_no_split:
-            z_ = z_.mean(dim=1, keepdim=True)
-
-        z_ /= lr_gain_z
-        z_ = z_.requires_grad_()
+            z_ /= lr_gain_z
+            z_ = z_.requires_grad_()
+            z[enc] = z_
 
         z0_, t2_, s_, R_ = pose_utils.matrix_to_pose(
             target_tform_cam2world,
@@ -809,248 +736,189 @@ if args.run_inversion:
         for _ in range(len(param_list)):
             grad_norms.append([])
 
-        model_to_call = parallel_model if z_.shape[
-            0] > 1 else parallel_model.module
+        for gan, parallel_model in parallel_models.items():
+            z_ = z[gan]
+            model_to_call = parallel_model if z_.shape[
+                0] > 1 else parallel_model.module
 
-        psnrs = []
-        lpipss = []
-        rot_errors = []
-        niter = max(checkpoint_steps)
+            psnrs = []
+            lpipss = []
+            rot_errors = []
+            niter = max(checkpoint_steps)
 
-        def evaluate_inversion(it):
-            item = report[it]
-            item['ws'].append(z_.detach().cpu() * lr_gain_z)
-            if z0_ is not None:
-                item['z0'].append(z0_.detach().cpu())
-            item['R'].append(R_.detach().cpu())
-            item['s'].append(s_.detach().cpu())
-            item['t2'].append(t2_.detach().cpu())
+            def evaluate_inversion(it):
+                item = report[it]
+                item['ws'].append(z_.detach().cpu() * lr_gain_z)
+                if z0_ is not None:
+                    item['z0'].append(z0_.detach().cpu())
+                item['R'].append(R_.detach().cpu())
+                item['s'].append(s_.detach().cpu())
+                item['t2'].append(t2_.detach().cpu())
 
-            # Compute metrics for report
-            cam, focal = pose_utils.pose_to_matrix(
-                z0_.detach() if z0_ is not None else None,
-                t2_.detach(),
-                s_.detach(),
-                F.normalize(R_.detach(), dim=-1),
-                camera_flipped=dataset_config['camera_flipped'])
-            rgb_predicted, _, acc_predicted, normals_predicted, semantics_predicted, extra_model_outputs = model_to_call(
-                cam,
-                focal,
-                target_center_fid,
-                target_bbox_fid,
-                z_.detach() * lr_gain_z,
-                use_ema=True,
-                compute_normals=args.use_sdf and idx == 0,
-                compute_semantics=args.attention_values > 0,
-                force_no_cam_grad=True,
-                extra_model_outputs=['attention_values']
-                if args.attention_values > 0 else [],
-                extra_model_inputs={
-                    k: v.detach() for k, v in extra_model_inputs.items()
-                },
-            )
+                # Compute metrics for report
+                cam, focal = pose_utils.pose_to_matrix(
+                    z0_.detach() if z0_ is not None else None,
+                    t2_.detach(),
+                    s_.detach(),
+                    F.normalize(R_.detach(), dim=-1),
+                    camera_flipped=dataset_config['camera_flipped'])
+                rgb_predicted, _, acc_predicted, normals_predicted, semantics_predicted, extra_model_outputs = model_to_call(
+                    cam,
+                    focal,
+                    target_center_fid,
+                    target_bbox_fid,
+                    z_.detach() * lr_gain_z,
+                    use_ema=True,
+                    compute_normals=args.use_sdf and idx == 0,
+                    compute_semantics=args.attention_values > 0,
+                    force_no_cam_grad=True,
+                    extra_model_outputs=['attention_values']
+                    if args.attention_values > 0 else [],
+                    extra_model_inputs={
+                        k: v.detach() for k, v in extra_model_inputs.items()
+                    },
+                )
+                plt.imshow(rgb_predicted[0].cpu().clamp(0, 1))
+                plt.savefig(f"{gan}.png")
 
-            rgb_predicted_perm = rgb_predicted.detach().permute(0, 3, 1,
-                                                                2).clamp_(
-                                                                    -1, 1)
-            target_perm = target_img_fid_.permute(0, 3, 1, 2)
-            item['psnr'].append(
-                metrics.psnr(rgb_predicted_perm[:, :3] / 2 + 0.5,
-                             target_perm[:, :3] / 2 + 0.5,
-                             reduction='none').cpu())
-            item['ssim'].append(
-                metrics.ssim(rgb_predicted_perm[:, :3] / 2 + 0.5,
-                             target_perm[:, :3] / 2 + 0.5,
-                             reduction='none').cpu())
-            if dataset_config['has_mask']:
-                item['iou'].append(
-                    metrics.iou(acc_predicted,
-                                target_perm[:, 3],
-                                reduction='none').cpu())
-            item['lpips'].append(
-                loss_fn_lpips(rgb_predicted_perm[:, :3],
-                              target_perm[:, :3],
-                              normalize=False).flatten().cpu())
-            item['inception_activations_front'].append(
-                torch.FloatTensor(
-                    fid.forward_inception_batch(
-                        inception_net, rgb_predicted_perm[:, :3] / 2 + 0.5)))
-            if not (args.dataset == 'p3d_car' and use_testset):
-                # Ground-truth poses are not available on P3D Car (test set)
-                item['rot_error'].append(
-                    pose_utils.rotation_matrix_distance(cam, gt_cam2world_mat))
+                rgb_predicted_perm = rgb_predicted.detach().permute(0, 3, 1,
+                                                                    2).clamp_(
+                                                                        -1, 1)
+                target_perm = target_img_fid_.permute(0, 3, 1, 2)
 
-            if writer is not None and idx == 0:
-                if it == checkpoint_steps[0]:
-                    writer.add_images(f'img/ref',
-                                      target_perm[:, :3].cpu() / 2 + 0.5, i)
-                writer.add_images('img/recon_front',
-                                  rgb_predicted_perm.cpu() / 2 + 0.5, it)
-                writer.add_images('img/mask_front',
-                                  acc_predicted.cpu().unsqueeze(1).clamp(0, 1),
-                                  it)
-                if normals_predicted is not None:
-                    writer.add_images(
-                        'img/normals_front',
-                        normals_predicted.cpu().permute(0, 3, 1, 2) / 2 + 0.5,
-                        it)
-                if semantics_predicted is not None:
-                    writer.add_images(
-                        'img/semantics_front',
-                        (semantics_predicted @ color_palette).cpu().permute(
-                            0, 3, 1, 2) / 2 + 0.5, it)
+                item['inception_activations_front'].append(
+                    torch.FloatTensor(
+                        fid.forward_inception_batch(
+                            inception_net, rgb_predicted_perm[:, :3] / 2 + 0.5)))
 
-            # Test with random poses
-            rgb_predicted, _, _, normals_predicted, semantics_predicted, _ = model_to_call(
-                target_tform_cam2world_perm,
-                target_focal_perm,
-                target_center_perm,
-                target_bbox_perm,
-                z_.detach() * lr_gain_z,
-                use_ema=True,
-                compute_normals=args.use_sdf and idx == 0,
-                compute_semantics=args.attention_values > 0 and idx == 0,
-                force_no_cam_grad=True,
-                extra_model_inputs={
-                    k: v.detach() for k, v in extra_model_inputs.items()
-                },
-            )
-            rgb_predicted_perm = rgb_predicted.detach().permute(0, 3, 1,
-                                                                2).clamp(-1, 1)
-            if views_per_object > 1:
-                target_perm_random = target_img_fid_random_.permute(0, 3, 1, 2)
-                item['psnr_random'].append(
-                    metrics.psnr(rgb_predicted_perm[:, :3] / 2 + 0.5,
-                                 target_perm_random[:, :3] / 2 + 0.5,
-                                 reduction='none').cpu())
-                item['ssim_random'].append(
-                    metrics.ssim(rgb_predicted_perm[:, :3] / 2 + 0.5,
-                                 target_perm_random[:, :3] / 2 + 0.5,
-                                 reduction='none').cpu())
-                item['lpips_random'].append(
-                    loss_fn_lpips(rgb_predicted_perm[:, :3],
-                                  target_perm_random[:, :3],
-                                  normalize=False).flatten().cpu())
-            item['inception_activations_random'].append(
-                torch.FloatTensor(
-                    fid.forward_inception_batch(
-                        inception_net, rgb_predicted_perm[:, :3] / 2 + 0.5)))
-            if writer is not None and idx == 0:
-                writer.add_images('img/recon_random',
-                                  rgb_predicted_perm.cpu() / 2 + 0.5, it)
-                writer.add_images('img/mask_random',
-                                  acc_predicted.cpu().unsqueeze(1).clamp(0, 1),
-                                  it)
-                if normals_predicted is not None:
-                    writer.add_images(
-                        'img/normals_random',
-                        normals_predicted.cpu().permute(0, 3, 1, 2) / 2 + 0.5,
-                        it)
-                if semantics_predicted is not None:
-                    writer.add_images(
-                        'img/semantics_random',
-                        (semantics_predicted @ color_palette).cpu().permute(
-                            0, 3, 1, 2) / 2 + 0.5, it)
+                #fid_stats = fid.calculate_stats(
+                #    report_entry[report_entry_key].numpy())
+                #fid_value = fid.calculate_frechet_distance(
+                #    *fid_stats, *train_eval_split.fid_stats)
 
-        if 0 in checkpoint_steps:
-            evaluate_inversion(0)
+                if writer is not None and idx == 0:
+                    if it == checkpoint_steps[0]:
+                        writer.add_images(f'img/ref',
+                                        target_perm[:, :3].cpu() / 2 + 0.5, i)
+                    writer.add_images('img/recon_front',
+                                    rgb_predicted_perm.cpu() / 2 + 0.5, it)
+                    writer.add_images('img/mask_front',
+                                    acc_predicted.cpu().unsqueeze(1).clamp(0, 1),
+                                    it)
+                    if normals_predicted is not None:
+                        writer.add_images(
+                            'img/normals_front',
+                            normals_predicted.cpu().permute(0, 3, 1, 2) / 2 + 0.5,
+                            it)
+                    if semantics_predicted is not None:
+                        writer.add_images(
+                            'img/semantics_front',
+                            (semantics_predicted @ color_palette).cpu().permute(
+                                0, 3, 1, 2) / 2 + 0.5, it)
 
-        def optimize_iter(module, rgb_predicted, acc_predicted,
-                          semantics_predicted, extra_model_outputs, target_img,
-                          cam, focal):
+            if 0 in checkpoint_steps:
+                evaluate_inversion(0)
 
-            target = target_img[..., :3]
+            def optimize_iter(module, rgb_predicted, acc_predicted,
+                            semantics_predicted, extra_model_outputs, target_img,
+                            cam, focal):
 
-            rgb_predicted_for_loss = rgb_predicted
-            target_for_loss = target
-            loss = 0.
-            if loss_to_use in ['vgg_nocrop', 'vgg', 'mixed']:
-                rgb_predicted_for_loss_aug = rgb_predicted_for_loss.permute(
-                    0, 3, 1, 2)
-                target_for_loss_aug = target_for_loss.permute(0, 3, 1, 2)
-                loss = loss + module.lpips_net(
-                    rgb_predicted_for_loss_aug, target_for_loss_aug
-                ).mean() * rgb_predicted.shape[
-                    0]  # Disjoint samples, sum instead of average over batch
-            if loss_to_use in ['l1', 'mixed']:
-                loss = loss + F.l1_loss(rgb_predicted_for_loss, target_for_loss
-                                       ) * rgb_predicted.shape[0]
-            if loss_to_use == 'mse':
-                loss = F.mse_loss(rgb_predicted_for_loss,
-                                  target_for_loss) * rgb_predicted.shape[0]
+                target = target_img[..., :3]
 
-            if loss_to_use == 'mixed':
-                loss = loss / 2  # Average L1 and VGG
+                rgb_predicted_for_loss = rgb_predicted
+                target_for_loss = target
+                loss = 0.
+                if loss_to_use in ['vgg_nocrop', 'vgg', 'mixed']:
+                    rgb_predicted_for_loss_aug = rgb_predicted_for_loss.permute(
+                        0, 3, 1, 2)
+                    target_for_loss_aug = target_for_loss.permute(0, 3, 1, 2)
+                    loss = loss + module.lpips_net(
+                        rgb_predicted_for_loss_aug, target_for_loss_aug
+                    ).mean() * rgb_predicted.shape[
+                        0]  # Disjoint samples, sum instead of average over batch
+                if loss_to_use in ['l1', 'mixed']:
+                    loss = loss + F.l1_loss(rgb_predicted_for_loss, target_for_loss
+                                        ) * rgb_predicted.shape[0]
+                if loss_to_use == 'mse':
+                    loss = F.mse_loss(rgb_predicted_for_loss,
+                                    target_for_loss) * rgb_predicted.shape[0]
 
-            with torch.no_grad():
-                psnr_monitor = metrics.psnr(rgb_predicted[..., :3] / 2 + 0.5,
-                                            target[..., :3] / 2 + 0.5)
-                lpips_monitor = module.lpips_net(
-                    rgb_predicted[..., :3].permute(0, 3, 1, 2),
-                    target[..., :3].permute(0, 3, 1, 2),
-                    normalize=False)
+                if loss_to_use == 'mixed':
+                    loss = loss / 2  # Average L1 and VGG
 
-            return loss, psnr_monitor, lpips_monitor, rgb_predicted
+                with torch.no_grad():
+                    psnr_monitor = metrics.psnr(rgb_predicted[..., :3] / 2 + 0.5,
+                                                target[..., :3] / 2 + 0.5)
+                    lpips_monitor = module.lpips_net(
+                        rgb_predicted[..., :3].permute(0, 3, 1, 2),
+                        target[..., :3].permute(0, 3, 1, 2),
+                        normalize=False)
 
-        for it in range(niter):
-            cam, focal = pose_utils.pose_to_matrix(
-                z0_,
-                t2_,
-                s_,
-                F.normalize(R_, dim=-1),
-                camera_flipped=dataset_config['camera_flipped'])
+                return loss, psnr_monitor, lpips_monitor, rgb_predicted
 
-            loss, psnr_monitor, lpips_monitor, rgb_predicted = model_to_call(
-                cam,
-                focal,
-                target_center,
-                target_bbox,
-                z_ * lr_gain_z,
-                use_ema=True,
-                ray_multiplier=1 if args.fine_sampling else 4,
-                res_multiplier=1,
-                compute_normals=False and args.use_sdf,
-                force_no_cam_grad=no_optimize_pose,
-                closure=optimize_iter,
-                closure_params={
-                    'target_img': target_img,
-                    'cam': cam,
-                    'focal': focal
-                },
-                extra_model_inputs=extra_model_inputs,
-            )
-            normal_map = None
-            loss = loss.sum()
-            psnr_monitor = psnr_monitor.mean()
-            lpips_monitor = lpips_monitor.mean()
-            if writer is not None and idx == 0:
-                writer.add_scalar('monitor_b0/psnr', psnr_monitor.item(), it)
-                writer.add_scalar('monitor_b0/lpips', lpips_monitor.item(), it)
-                rot_error = pose_utils.rotation_matrix_distance(
-                    cam, gt_cam2world_mat).mean().item()
-                rot_errors.append(rot_error)
-                writer.add_scalar('monitor_b0/rot_error', rot_error, it)
+            for it in range(niter):
+                cam, focal = pose_utils.pose_to_matrix(
+                    z0_,
+                    t2_,
+                    s_,
+                    F.normalize(R_, dim=-1),
+                    camera_flipped=dataset_config['camera_flipped'])
 
-            if args.use_sdf and normal_map is not None:
-                rgb_predicted = torch.cat(
-                    (rgb_predicted.detach(), normal_map.detach()), dim=-2)
+                loss, psnr_monitor, lpips_monitor, rgb_predicted = model_to_call(
+                    cam,
+                    focal,
+                    target_center,
+                    target_bbox,
+                    z_ * lr_gain_z,
+                    use_ema=True,
+                    ray_multiplier=1 if args.fine_sampling else 4,
+                    res_multiplier=1,
+                    compute_normals=False and args.use_sdf,
+                    force_no_cam_grad=no_optimize_pose,
+                    closure=optimize_iter,
+                    closure_params={
+                        'target_img': target_img,
+                        'cam': cam,
+                        'focal': focal
+                    },
+                    extra_model_inputs=extra_model_inputs,
+                )
+                normal_map = None
+                loss = loss.sum()
+                psnr_monitor = psnr_monitor.mean()
+                lpips_monitor = lpips_monitor.mean()
+                if writer is not None and idx == 0:
+                    writer.add_scalar('monitor_b0/psnr', psnr_monitor.item(), it)
+                    writer.add_scalar('monitor_b0/lpips', lpips_monitor.item(), it)
+                    rot_error = pose_utils.rotation_matrix_distance(
+                        cam, gt_cam2world_mat).mean().item()
+                    rot_errors.append(rot_error)
+                    writer.add_scalar('monitor_b0/rot_error', rot_error, it)
 
-            loss.backward()
-            for i, param in enumerate(param_list):
-                if param.grad is not None:
-                    grad_norms[i].append(param.grad.norm().item())
-                else:
-                    grad_norms[i].append(0.)
-            optimizer.step()
-            optimizer.zero_grad()
-            R_.data[:] = F.normalize(R_.data, dim=-1)
-            if z0_ is not None:
-                z0_.data.clamp_(-4, 4)
-            s_.data.abs_()
+                if args.use_sdf and normal_map is not None:
+                    rgb_predicted = torch.cat(
+                        (rgb_predicted.detach(), normal_map.detach()), dim=-2)
 
-            if it + 1 in report:
-                evaluate_inversion(it + 1)
+                loss.backward()
+                for i, param in enumerate(param_list):
+                    if param.grad is not None:
+                        grad_norms[i].append(param.grad.norm().item())
+                    else:
+                        grad_norms[i].append(0.)
+                optimizer.step()
+                optimizer.zero_grad()
+                R_.data[:] = F.normalize(R_.data, dim=-1)
+                if z0_ is not None:
+                    z0_.data.clamp_(-4, 4)
+                s_.data.abs_()
 
+                if it + 1 in report:
+                    evaluate_inversion(it + 1)
+        
+            plt.imshow(rgb_predicted[0].detach().cpu().clamp(0, 1))
+            plt.savefig(f"{gan}_optimized.png")
+
+            
         t2 = time.time()
         idx += test_bs
         print(
@@ -1101,6 +969,7 @@ if args.run_inversion:
                 return None
             fid_stats = fid.calculate_stats(
                 report_entry[report_entry_key].numpy())
+            print(fid_stats.shape)
             fid_value = fid.calculate_frechet_distance(
                 *fid_stats, *train_eval_split.fid_stats)
             report_entry[tensorboard_key] = fid_value
