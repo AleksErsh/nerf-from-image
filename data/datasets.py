@@ -333,13 +333,9 @@ class CustomDataset(torch.utils.data.Dataset):
         img, mask, _ = self.crop_image(img, mask, bbox, copy.deepcopy(sfm_pose))
 
         # important! sfm_pose must not be overwritten -- it is already in the correct reference frame
-        sfm_pose_ref = copy.deepcopy(sfm_pose)
         img_ref, mask_ref, _ = self.scale_image(img.copy(), mask.copy(),
                                                 copy.deepcopy(sfm_pose),
                                                 self.img_size)
-
-        # Normalize kp to be [-1, 1]
-        img_h, img_w = img_ref.shape[:2]
 
         # Finally transpose the image to 3xHxW
         img_ref = np.transpose(img_ref, (2, 0, 1))
@@ -372,13 +368,14 @@ class CustomDataset(torch.utils.data.Dataset):
 
         # Multiply img with mask
         mask = mask[None, :, :]
-        img = img * 2 - 1
+        #img = img * 2 - 1
         if not self.debug_disable_mask:
-            img *= mask
-        img = np.concatenate((img, mask), axis=0)
+            masked_img = mask * img
+        masked_img = np.concatenate((masked_img, mask), axis=0)
 
         elem = {
-            'img': img.astype(np.float32),
+            'orig_img': img.astype(np.float32),
+            'img': masked_img.astype(np.float32),
             'normalized_bbox': normalized_bbox.astype(np.float32),
             'focal': focal,
             'pose': M.astype(np.float32),

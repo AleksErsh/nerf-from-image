@@ -697,12 +697,12 @@ if args.run_inversion:
                 else:
                     target_coords, target_mask, target_w = coord_regressor(
                         coord_regressor_img)
-            #if use_pose_regressor:
-            #    assert target_coords is not None
-            #    estimated_cam2world_mat, estimated_focal, _ = estimate_poses_batch(
-            #        target_coords, target_mask, focal_guesses)
-            #    target_tform_cam2world = estimated_cam2world_mat
-            #    target_focal = estimated_focal
+            if use_pose_regressor:
+                assert target_coords is not None
+                estimated_cam2world_mat, estimated_focal, _ = estimate_poses_batch(
+                    target_coords, target_mask, focal_guesses)
+                target_tform_cam2world = estimated_cam2world_mat
+                target_focal = estimated_focal
             assert target_w is not None
             z_ = target_w
 

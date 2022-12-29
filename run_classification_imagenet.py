@@ -381,8 +381,9 @@ def run_inversion(
 
         gt_cam2world_mat = target_tform_cam2world.clone()
 
+        print(target_img.shape)
         plt.imshow(target_img[0][:,:,:3].cpu())
-        plt.savefig(f"resources/my_images/target.png")
+        plt.savefig(f"resources/my_images/target_{idx}.png")
 
         z = {}
         for cls_name, cls_encoder in encoders.items():
@@ -441,10 +442,9 @@ def run_inversion(
                     cfg,
                     model_to_call, cls_name,
                     z_, z0_, R_, s_, t2_,
-                    target_center_fid, target_bbox_fid
+                    target_center_fid, target_bbox_fid,
+                    idx
                 )
-            
-            exit()
 
             """def optimize_iter(module, rgb_predicted, acc_predicted,
                             semantics_predicted, extra_model_outputs, target_img,
@@ -544,11 +544,45 @@ def run_inversion(
             f'[{idx}/{len(image_indices)}] Finished batch in {t2-t1} s ({(t2-t1)/test_bs} s/img)'
         )
 
+def estimate_poses_batch(target_coords, target_mask, focal_guesses):
+    target_mask = target_mask > 0.9
+    if focal_guesses is None:
+        # Use a large focal length to approximate ortho projection
+        is_ortho = True
+        focal_guesses = [100.]
+    else:
+        is_ortho = False
+
+    world2cam_mat, estimated_focal, errors = pose_estimation.compute_pose_pnp(
+        target_coords.cpu().numpy(),
+        target_mask.cpu().numpy(), focal_guesses)
+
+    if is_ortho:
+        # Convert back to ortho
+        s = 2 * focal_guesses[0] / -world2cam_mat[:, 2, 3]
+        t2 = world2cam_mat[:, :2, 3] * s[..., None]
+        world2cam_mat_ortho = world2cam_mat.copy()
+        world2cam_mat_ortho[:, :2, 3] = t2
+        world2cam_mat_ortho[:, 2, 3] = -10.
+        world2cam_mat = world2cam_mat_ortho
+
+    estimated_cam2world_mat = pose_utils.invert_space(
+        torch.from_numpy(world2cam_mat).float()).to(target_coords.device)
+    estimated_focal = torch.from_numpy(estimated_focal).float().to(
+        target_coords.device)
+    if is_ortho:
+        estimated_cam2world_mat /= torch.from_numpy(
+            s[:, None, None]).float().to(estimated_cam2world_mat.device)
+        estimated_focal = None
+
+    return estimated_cam2world_mat, estimated_focal, errors
+
 def evaluate_inversion(
     cfg,
     model_to_call, cls_name,
     z_, z0_, R_, s_, t2_,
-    target_center_fid, target_bbox_fid
+    target_center_fid, target_bbox_fid,
+    idx
 ):
 
     # Compute metrics for report
@@ -566,9 +600,9 @@ def evaluate_inversion(
         target_bbox_fid,
         z_.detach()
     )
-
+    print(rgb_predicted.shape)
     plt.imshow(rgb_predicted[0].cpu().clamp(0, 1))
-    plt.savefig(f"resources/my_images/{cls_name}.png")
+    plt.savefig(f"resources/my_images/{cls_name}_{idx}.png")
 
 
 def main():
