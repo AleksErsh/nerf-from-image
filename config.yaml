@@ -2,7 +2,10 @@ gpus: 1
 
 root_path: "."
 
-dataset: imagenet_airplane
+dataset:
+  - imagenet_airplane
+  - imagenet_car
+  - imagenet_elephant
 data_path: datasets
 dataset_config:
   resolution: 128
