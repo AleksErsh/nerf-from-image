@@ -13,6 +13,7 @@ from tqdm import tqdm
 from glob import glob
 from omegaconf import OmegaConf
 from typing import Tuple, List
+from pathlib import Path
 
 import arguments
 from data import loaders
@@ -333,7 +334,8 @@ def create_generator(cfg):
 
 def run_inversion(
     cfg, encoders, models_ema, generators,
-    train_split, train_eval_split, test_split
+    train_split, train_eval_split, test_split,
+    save_images: bool = False
 ):
 
     batch_size = 1
@@ -381,9 +383,10 @@ def run_inversion(
 
         gt_cam2world_mat = target_tform_cam2world.clone()
 
-        print(target_img.shape)
-        plt.imshow(target_img[0][:,:,:3].cpu())
-        plt.savefig(f"resources/my_images/target_{idx}.png")
+        if save_images:
+            Path("resources/images/targets").mkdir(parents=True, exist_ok=True)
+            plt.imshow(target_img[0][:,:,:3].cpu())
+            plt.savefig(f"resources/images/targets/target_{idx}.png")
 
         z = {}
         for cls_name, cls_encoder in encoders.items():
@@ -438,12 +441,11 @@ def run_inversion(
             niter = max(checkpoint_steps)
 
             if 0 in checkpoint_steps:
-                evaluate_inversion(
+                rgb_predicted = evaluate_inversion(
                     cfg,
                     model_to_call, cls_name,
                     z_, z0_, R_, s_, t2_,
                     target_center_fid, target_bbox_fid,
-                    idx
                 )
 
             """def optimize_iter(module, rgb_predicted, acc_predicted,
@@ -489,7 +491,7 @@ def run_inversion(
                     t2_,
                     s_,
                     F.normalize(R_, dim=-1),
-                    camera_flipped=dataset_config['camera_flipped'])
+                    camera_flipped=cfg.dataset_config['camera_flipped'])
 
                 loss, psnr_monitor, lpips_monitor, rgb_predicted = model_to_call(
                     cam,
@@ -536,7 +538,12 @@ def run_inversion(
                     evaluate_inversion(it + 1)
         
             plt.imshow(rgb_predicted[0].detach().cpu().clamp(0, 1))
-            plt.savefig(f"{gan}_optimized.png")"""
+            plt.savefig(f"resources/images/{cls_name}_{idx}_optimized.png")"""
+            
+            if save_images:
+                Path(f"resources/images/{cls_name}").mkdir(parents=True, exist_ok=True)
+                plt.imshow(rgb_predicted[0].cpu().clamp(0, 1))
+                plt.savefig(f"resources/images/{cls_name}/{cls_name}_{idx}.png")
 
         t2 = time.time()
         idx += test_bs
@@ -582,7 +589,6 @@ def evaluate_inversion(
     model_to_call, cls_name,
     z_, z0_, R_, s_, t2_,
     target_center_fid, target_bbox_fid,
-    idx
 ):
 
     # Compute metrics for report
@@ -600,9 +606,7 @@ def evaluate_inversion(
         target_bbox_fid,
         z_.detach()
     )
-    print(rgb_predicted.shape)
-    plt.imshow(rgb_predicted[0].cpu().clamp(0, 1))
-    plt.savefig(f"resources/my_images/{cls_name}_{idx}.png")
+    return rgb_predicted
 
 
 def main():
@@ -612,7 +616,8 @@ def main():
     _, train_split, train_eval_split, test_split = imagenet_loader.load_dataset(cfg, DEVICE)
     run_inversion(
         cfg, encoders, models_ema, generators,
-        train_split, train_eval_split, test_split
+        train_split, train_eval_split, test_split,
+        save_images=True
     )
 
 

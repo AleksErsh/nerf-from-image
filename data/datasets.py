@@ -92,7 +92,7 @@ class CustomDataset(torch.utils.data.Dataset):
         self.detections = np.load(path, allow_pickle=True)
         # To run with partial data
         self.detections = np.array([elem for elem in self.detections if os.path.exists(elem["image_path"])])
-        self.indices = [int(elem["image_path"].split("_")[-1].split(".")[0]) for elem in self.detections]
+        self.indices = [int(elem["id"]) for elem in self.detections]
 
         if split == 'imagenet_test':
             aux_dataset = dataset.replace('p3d', 'imagenet')
@@ -271,6 +271,7 @@ class CustomDataset(torch.utils.data.Dataset):
         else:
             mirrored = False
         item = self.detections[idx_]
+        pose_idx_ = item["id"]
 
         img_path_rel = os.path.join(self.root_dir,
                                     item['image_path'].replace('datasets/', ''))
@@ -287,8 +288,8 @@ class CustomDataset(torch.utils.data.Dataset):
         # Sfm pose layout:
         # Focal, Translation xyz, Rot
         sfm_pose = [
-            self.poses['f'][idx_].numpy(), self.poses['t'][idx_].numpy(),
-            self.poses['R'][idx_].numpy()
+            self.poses['f'][pose_idx_].numpy(), self.poses['t'][pose_idx_].numpy(),
+            self.poses['R'][pose_idx_].numpy()
         ]
 
         crop = self.crop  # ImageNet / P3D
