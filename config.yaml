@@ -1,0 +1,58 @@
+gpus: 1
+
+root_path: "."
+
+dataset: imagenet_airplane
+data_path: datasets
+dataset_config:
+  resolution: 128
+  augment_p: 0
+  scene_range: 1.4
+  white_background: False
+  has_mask: True
+  has_bbox: True
+  is_highres: True
+  views_per_object: 1
+  views_per_object_test: None
+  camera_projection_model: perspective
+  camera_flipped: True
+
+use_viewdir: False
+use_sdf: True
+fine_sampling: True
+batch_size: 4
+
+rendering:
+  depth_samples_per_ray: 64
+  randomize: True
+  compute_normals: False
+  compute_semantics: False
+  compute_coords: False
+  extra_model_outputs: []
+  extra_model_inputs: {}
+  force_no_cam_grad: False
+
+generator:
+  resolution: 128
+  use_ema: True
+  res_multiplier: 1
+  ray_multiplier: 1
+  pretrain_sdf: False
+  encoder_output: False
+  use_encoder: False
+  disable_stylegan_noise: True
+  attention_values: 10
+
+encoder_weights_dir: coords_checkpoints
+generator_weights_dir: gan_checkpoints
+
+ImageNet:
+  airplane:
+    encoder_checkpoint_path: g_imagenet_airplane_pretrained/c_it300000_latest.pth
+    generator_checkpoint_path: g_imagenet_airplane_pretrained/checkpoint_latest.pth
+  car:
+    encoder_checkpoint_path: g_imagenet_car_pretrained/c_it300000_latest.pth
+    generator_checkpoint_path: g_imagenet_car_pretrained/checkpoint_latest.pth
+  elephant:
+    encoder_checkpoint_path: g_imagenet_elephant_pretrained/c_it200000_latest.pth
+    generator_checkpoint_path: g_imagenet_elephant_pretrained/checkpoint_latest.pth
