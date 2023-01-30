@@ -1,0 +1,8 @@
+# python cache
+__pycache__
+
+# folders with weights and data
+coords_checkpoints
+gan_checkpoints
+datasets
+resources
