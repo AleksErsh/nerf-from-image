@@ -10,3 +10,4 @@ tqdm
 lpips
 pycocotools
 pytorch-fid
+omegaconf
