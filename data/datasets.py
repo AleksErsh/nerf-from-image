@@ -91,8 +91,9 @@ class CustomDataset(torch.utils.data.Dataset):
                                      'poses_estimated_singletpl_perspective.bin')
         self.detections = np.load(path, allow_pickle=True)
         # To run with partial data
-        self.detections = np.array([elem for elem in self.detections if os.path.exists(elem["image_path"])])
-        self.indices = [int(elem["id"]) for elem in self.detections]
+        self.detections = np.array(
+            [elem for elem in self.detections if os.path.exists(elem["image_path"])]
+        )
 
         if split == 'imagenet_test':
             aux_dataset = dataset.replace('p3d', 'imagenet')
@@ -120,7 +121,9 @@ class CustomDataset(torch.utils.data.Dataset):
 
         self.poses = torch.load(poses_dir)
         # To run with partial data
-        #self.detections = self.detections[self.indices]  # Pre-filter
+        self.detections = np.array(
+            [elem for elem in self.detections if elem["id"] in self.poses["indices"]]
+        )
         if split == 'imagenet_test':
             valid_indices = valid_indices[self.poses['indices']]
             self.detections = self.detections[valid_indices]
@@ -287,6 +290,7 @@ class CustomDataset(torch.utils.data.Dataset):
 
         # Sfm pose layout:
         # Focal, Translation xyz, Rot
+        pose_idx_ = self.poses["indices"].tolist().index(pose_idx_)
         sfm_pose = [
             self.poses['f'][pose_idx_].numpy(), self.poses['t'][pose_idx_].numpy(),
             self.poses['R'][pose_idx_].numpy()
@@ -351,8 +355,10 @@ class CustomDataset(torch.utils.data.Dataset):
         M = flip @ M
         M = np.linalg.inv(M)
 
-        class_label = -1
-        return img_ref, mask_ref, focal, M, sfm_pose, mirrored, img_path_rel, normalized_bbox, class_label
+        class_id = item["class_id"]
+        class_name = item["class"]
+        
+        return img_ref, mask_ref, focal, M, sfm_pose, mirrored, img_path_rel, normalized_bbox, class_id, class_name
 
     def get_paths(self):
         paths = []
@@ -363,7 +369,7 @@ class CustomDataset(torch.utils.data.Dataset):
         return paths
 
     def __getitem__(self, index):
-        img, mask, focal, M, sfm_pose, mirrored, path, normalized_bbox, class_label = self.forward_img(
+        img, mask, focal, M, sfm_pose, mirrored, path, normalized_bbox, class_id, class_name = self.forward_img(
             index)
         sfm_pose[0].shape = 1
 
@@ -384,7 +390,8 @@ class CustomDataset(torch.utils.data.Dataset):
             'mirrored': mirrored,
             'inds': index,
             'path': path,
-            'class': class_label,
+            'class_id': class_id,
+            'class': class_name
         }
 
         return elem
