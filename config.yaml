@@ -5,7 +5,7 @@ root_path: "."
 dataset:
   - imagenet_airplane
   - imagenet_car
-  - imagenet_elephant
+  #- imagenet_elephant
 data_path: datasets
 dataset_config:
   resolution: 128
@@ -56,6 +56,11 @@ ImageNet:
   car:
     encoder_checkpoint_path: g_imagenet_car_pretrained/c_it300000_latest.pth
     generator_checkpoint_path: g_imagenet_car_pretrained/checkpoint_latest.pth
-  elephant:
-    encoder_checkpoint_path: g_imagenet_elephant_pretrained/c_it200000_latest.pth
-    generator_checkpoint_path: g_imagenet_elephant_pretrained/checkpoint_latest.pth
+  #elephant:
+  #  encoder_checkpoint_path: g_imagenet_elephant_pretrained/c_it200000_latest.pth
+  #  generator_checkpoint_path: g_imagenet_elephant_pretrained/checkpoint_latest.pth
+
+inv:
+  no_optimize_pose: False
+  lr_gain_z: 5
+  loss: vgg

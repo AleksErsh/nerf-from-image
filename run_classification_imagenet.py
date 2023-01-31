@@ -228,7 +228,9 @@ class ParallelModel(nn.Module):
                 focal,
                 center,
                 bbox,
-                c):
+                c,
+                closure=None,
+                closure_params=None):
         model_to_use = self.model_ema if self.use_ema else self.model
         if self.pretrain_sdf:
             return model_to_use(
@@ -249,6 +251,10 @@ class ParallelModel(nn.Module):
             c,
             self.cfg
         )
+        if closure is not None:
+            return closure(
+                self, output[0], output[2], output[4], output[-1],
+                **closure_params)  # RGB, alpha, semantics, extra_outptus
 
         return output
 
@@ -332,11 +338,13 @@ def create_generator(cfg):
         use_sdf=cfg.use_sdf,
         num_classes=None).to(DEVICE)
 
-def run_inversion(
+def run_classification(
     cfg, encoders, models_ema, generators,
     train_split, train_eval_split, test_split,
-    save_images: bool = False
+    save_images: bool = False, every_n_steps: int = None
 ):
+    if save_images:
+        assert isinstance(every_n_steps, int)
 
     batch_size = 1
     test_bs = batch_size
@@ -361,6 +369,9 @@ def run_inversion(
 
     idx = 0
 
+    target_classes = []
+    predict_classes = []
+
     while idx < len(image_indices):
         t1 = time.time()
 
@@ -370,6 +381,7 @@ def run_inversion(
         target_img_idx = image_indices[idx:idx + test_bs]
 
         target_img = train_split[target_img_idx].images
+        target_cls = train_split[target_img_idx].classes_id
 
         # Target for evaluation
         target_img_fid_ = train_eval_split[
@@ -383,7 +395,7 @@ def run_inversion(
 
         gt_cam2world_mat = target_tform_cam2world.clone()
 
-        if save_images:
+        if save_images and idx % every_n_steps == 0:
             Path("resources/images/targets").mkdir(parents=True, exist_ok=True)
             plt.imshow(target_img[0][:,:,:3].cpu())
             plt.savefig(f"resources/images/targets/target_{idx}.png")
@@ -401,12 +413,12 @@ def run_inversion(
                         coord_regressor_img)
                 assert target_coords is not None
 
-                #estimated_cam2world_mat, estimated_focal, _ = estimate_poses_batch(
-                #    target_coords, target_mask, focal_guesses
-                #)
-                #target_tform_cam2world = estimated_cam2world_mat
-                #target_focal = estimated_focal 
-                #assert target_w is not None
+                estimated_cam2world_mat, estimated_focal, _ = estimate_poses_batch(
+                    target_coords, target_mask, focal_guesses
+                )
+                target_tform_cam2world = estimated_cam2world_mat
+                target_focal = estimated_focal 
+                assert target_w is not None
 
                 z_ = target_w
 
@@ -433,6 +445,7 @@ def run_inversion(
         for _ in range(len(param_list)):
             grad_norms.append([])
 
+        predicted = {}
         for cls_name, cls_generator in generators.items():
             z_ = z[cls_name]
             model_to_call = cls_generator if z_.shape[
@@ -448,16 +461,18 @@ def run_inversion(
                     target_center_fid, target_bbox_fid,
                 )
 
-            """def optimize_iter(module, rgb_predicted, acc_predicted,
-                            semantics_predicted, extra_model_outputs, target_img,
-                            cam, focal):
+            def optimize_iter(
+                module, rgb_predicted, acc_predicted,
+                semantics_predicted, extra_model_outputs, target_img,
+                cam, focal
+            ):
 
                 target = target_img[..., :3]
 
                 rgb_predicted_for_loss = rgb_predicted
                 target_for_loss = target
                 loss = 0.
-                if loss_to_use in ['vgg_nocrop', 'vgg', 'mixed']:
+                if cfg.inv.loss in ['vgg_nocrop', 'vgg', 'mixed']:
                     rgb_predicted_for_loss_aug = rgb_predicted_for_loss.permute(
                         0, 3, 1, 2)
                     target_for_loss_aug = target_for_loss.permute(0, 3, 1, 2)
@@ -465,14 +480,14 @@ def run_inversion(
                         rgb_predicted_for_loss_aug, target_for_loss_aug
                     ).mean() * rgb_predicted.shape[
                         0]  # Disjoint samples, sum instead of average over batch
-                if loss_to_use in ['l1', 'mixed']:
+                if cfg.inv.loss in ['l1', 'mixed']:
                     loss = loss + F.l1_loss(rgb_predicted_for_loss, target_for_loss
                                         ) * rgb_predicted.shape[0]
-                if loss_to_use == 'mse':
+                if cfg.inv.loss == 'mse':
                     loss = F.mse_loss(rgb_predicted_for_loss,
                                     target_for_loss) * rgb_predicted.shape[0]
 
-                if loss_to_use == 'mixed':
+                if cfg.inv.loss == 'mixed':
                     loss = loss / 2  # Average L1 and VGG
 
                 with torch.no_grad():
@@ -498,26 +513,20 @@ def run_inversion(
                     focal,
                     target_center,
                     target_bbox,
-                    z_ * lr_gain_z,
-                    use_ema=True,
-                    ray_multiplier=1 if args.fine_sampling else 4,
-                    res_multiplier=1,
-                    compute_normals=False and args.use_sdf,
-                    force_no_cam_grad=no_optimize_pose,
+                    z_ * cfg.inv.lr_gain_z,
                     closure=optimize_iter,
                     closure_params={
                         'target_img': target_img,
                         'cam': cam,
                         'focal': focal
-                    },
-                    extra_model_inputs=extra_model_inputs,
+                    }
                 )
                 normal_map = None
                 loss = loss.sum()
                 psnr_monitor = psnr_monitor.mean()
                 lpips_monitor = lpips_monitor.mean()
 
-                if args.use_sdf and normal_map is not None:
+                if cfg.use_sdf and normal_map is not None:
                     rgb_predicted = torch.cat(
                         (rgb_predicted.detach(), normal_map.detach()), dim=-2)
 
@@ -534,22 +543,35 @@ def run_inversion(
                     z0_.data.clamp_(-4, 4)
                 s_.data.abs_()
 
-                if it + 1 in report:
-                    evaluate_inversion(it + 1)
-        
-            plt.imshow(rgb_predicted[0].detach().cpu().clamp(0, 1))
-            plt.savefig(f"resources/images/{cls_name}_{idx}_optimized.png")"""
-            
-            if save_images:
+                rgb_predicted = evaluate_inversion(
+                    cfg,
+                    model_to_call, cls_name,
+                    z_, z0_, R_, s_, t2_,
+                    target_center_fid, target_bbox_fid,
+                )
+
+            target_img = target_img[..., :3]
+            predicted[train_split.class_to_id[cls_name]] = metrics.psnr(
+                target_img / 2 + 0.5, rgb_predicted / 2 + 0.5
+            )
+
+            if save_images and idx % every_n_steps == 0:
                 Path(f"resources/images/{cls_name}").mkdir(parents=True, exist_ok=True)
                 plt.imshow(rgb_predicted[0].cpu().clamp(0, 1))
                 plt.savefig(f"resources/images/{cls_name}/{cls_name}_{idx}.png")
+        
+        predict_cls = max(zip(predicted.values(), predicted.keys()))[1]
+
+        target_classes.append(target_cls.cpu().item())
+        predict_classes.append(predict_cls.cpu().item())
 
         t2 = time.time()
         idx += test_bs
         print(
             f'[{idx}/{len(image_indices)}] Finished batch in {t2-t1} s ({(t2-t1)/test_bs} s/img)'
         )
+
+    return target_classes, predict_classes
 
 def estimate_poses_batch(target_coords, target_mask, focal_guesses):
     target_mask = target_mask > 0.9
@@ -614,11 +636,16 @@ def main():
     encoders = load_encoders(cfg)
     models_ema, generators = load_generators(cfg)
     _, train_split, train_eval_split, test_split = imagenet_loader.load_dataset(cfg, DEVICE)
-    run_inversion(
+    targets, predicts = run_classification(
         cfg, encoders, models_ema, generators,
         train_split, train_eval_split, test_split,
-        save_images=True
+        save_images=True, every_n_steps=100
     )
+    Path("./resources/results").mkdir(parents=True, exist_ok=True)
+    with open("./resources/results/targets.npy", 'wb') as f:
+        np.save(f, np.array(targets))
+    with open("./resources/results/predicts.npy", 'wb') as f:
+        np.save(f, np.array(predicts))
 
 
 if __name__ == "__main__":
