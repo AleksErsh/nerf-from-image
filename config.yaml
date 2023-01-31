@@ -61,6 +61,6 @@ ImageNet:
   #  generator_checkpoint_path: g_imagenet_elephant_pretrained/checkpoint_latest.pth
 
 inv:
-  no_optimize_pose: False
-  lr_gain_z: 5
+  no_optimize_pose: True
+  lr_gain_z: 25
   loss: vgg

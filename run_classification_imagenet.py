@@ -365,7 +365,7 @@ def run_classification(
                                                 dim=0).sort()[0]
     image_indices = train_eval_split.eval_indices
 
-    checkpoint_steps = [0, 30]
+    checkpoint_steps = [0]
 
     idx = 0
 
@@ -400,8 +400,14 @@ def run_classification(
             plt.imshow(target_img[0][:,:,:3].cpu())
             plt.savefig(f"resources/images/targets/target_{idx}.png")
 
-        z = {}
-        for cls_name, cls_encoder in encoders.items():
+        predicted = {}
+        for cls_name in cfg.ImageNet:
+
+            cls_encoder = encoders[cls_name]
+            cls_generator = generators[cls_name]
+
+            z_avg = models_ema[cls_name].mapping_network.get_average_w()
+
             with torch.no_grad():
 
                 coord_regressor_img = target_img[..., :3].permute(0, 3, 1, 2)
@@ -421,33 +427,31 @@ def run_classification(
                 assert target_w is not None
 
                 z_ = target_w
+                z_ = z_.mean(dim=1, keepdim=True)
 
+            z_ /= cfg.inv.lr_gain_z
             z_ = z_.requires_grad_()
-            z[cls_name] = z_
 
-        z0_, t2_, s_, R_ = pose_utils.matrix_to_pose(
-            target_tform_cam2world,
-            target_focal,
-            camera_flipped=cfg.dataset_config.camera_flipped
-        )
-        # Optimize pose
-        t2_.requires_grad_()
-        s_.requires_grad_()
-        R_.requires_grad_()
-        param_list = [z_, R_, s_, t2_]
-        if z0_ is not None:
-            z0_.requires_grad_()
-            param_list = [param_list[0]] + [z0_] + param_list[1:]
+            z0_, t2_, s_, R_ = pose_utils.matrix_to_pose(
+                target_tform_cam2world,
+                target_focal,
+                camera_flipped=cfg.dataset_config.camera_flipped
+            )
+            # Optimize pose
+            t2_.requires_grad_()
+            s_.requires_grad_()
+            R_.requires_grad_()
+            param_list = [z_, R_, s_, t2_]
+            if z0_ is not None:
+                z0_.requires_grad_()
+                param_list = [z_, z0_, R_, s_, t2_]
 
-        extra_model_inputs = {}
-        optimizer = torch.optim.Adam(param_list, lr=2e-3, betas=(0.9, 0.95))
-        grad_norms = []
-        for _ in range(len(param_list)):
-            grad_norms.append([])
+            extra_model_inputs = {}
+            optimizer = torch.optim.Adam(param_list, lr=2e-3, betas=(0.9, 0.95))
+            grad_norms = []
+            for _ in range(len(param_list)):
+                grad_norms.append([])
 
-        predicted = {}
-        for cls_name, cls_generator in generators.items():
-            z_ = z[cls_name]
             model_to_call = cls_generator if z_.shape[
                 0] > 1 else cls_generator.module
 
@@ -457,7 +461,7 @@ def run_classification(
                 rgb_predicted = evaluate_inversion(
                     cfg,
                     model_to_call, cls_name,
-                    z_, z0_, R_, s_, t2_,
+                    z_ * cfg.inv.lr_gain_z, z0_, R_, s_, t2_,
                     target_center_fid, target_bbox_fid,
                 )
 
@@ -546,7 +550,7 @@ def run_classification(
                 rgb_predicted = evaluate_inversion(
                     cfg,
                     model_to_call, cls_name,
-                    z_, z0_, R_, s_, t2_,
+                    z_ * cfg.inv.lr_gain_z, z0_, R_, s_, t2_,
                     target_center_fid, target_bbox_fid,
                 )
 
