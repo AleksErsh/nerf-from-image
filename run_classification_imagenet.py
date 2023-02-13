@@ -267,13 +267,13 @@ def load_encoders(cfg) -> dict:
     encoders_checkpoints_dir = os.path.join(cfg.root_path, cfg.encoder_weights_dir)
 
     encoders = {}
-    for cls_name, cls in cfg.ImageNet.items():
+    for cls_name, cls_ in cfg.ImageNet.items():
         cls_encoder = encoder.BootstrapEncoder(
             latent_dim=512,
             pretrained=False).to(DEVICE)
 
         cls_encoder = nn.DataParallel(cls_encoder, GPU_IDS)
-        checkpoint_path = os.path.join(encoders_checkpoints_dir, cls["encoder_checkpoint_path"])
+        checkpoint_path = os.path.join(encoders_checkpoints_dir, cls_["encoder_checkpoint_path"])
         with utils.open_file(checkpoint_path, 'rb') as checkpoint:
             cls_encoder.load_state_dict(
                 torch.load(checkpoint, map_location='cpu')['model_coord']
@@ -349,7 +349,7 @@ def run_classification(
     batch_size = 1
     test_bs = batch_size
 
-    focal_guesses = pose_estimation.get_focal_guesses(train_split.focal_length)
+    focal_guesses = pose_estimation.get_focal_guesses(train_eval_split.focal_length)
 
     random_generator = torch.Generator()
     random_generator.manual_seed(1234)
@@ -365,10 +365,11 @@ def run_classification(
                                                 dim=0).sort()[0]
     image_indices = train_eval_split.eval_indices
 
-    checkpoint_steps = [0]
+    checkpoint_steps = [0, 30]
 
     idx = 0
 
+    indexes = []
     target_classes = []
     predict_classes = []
 
@@ -380,14 +381,14 @@ def run_classification(
 
         target_img_idx = image_indices[idx:idx + test_bs]
 
-        target_img = train_split[target_img_idx].images
-        target_cls = train_split[target_img_idx].classes_id
+        target_img = train_eval_split[target_img_idx].images
+        target_cls = train_eval_split[target_img_idx].classes_id
 
         # Target for evaluation
         target_img_fid_ = train_eval_split[
             target_img_idx].images  # Cropped
-        target_tform_cam2world = train_split[target_img_idx].tform_cam2world
-        target_focal = train_split[target_img_idx].focal_length
+        target_tform_cam2world = train_eval_split[target_img_idx].tform_cam2world
+        target_focal = train_eval_split[target_img_idx].focal_length
         target_center = None
         target_bbox = None
         target_center_fid = train_eval_split[target_img_idx].center
@@ -398,6 +399,7 @@ def run_classification(
         if save_images and idx % every_n_steps == 0:
             Path("resources/images/targets").mkdir(parents=True, exist_ok=True)
             plt.imshow(target_img[0][:,:,:3].cpu())
+            plt.axis("off")
             plt.savefig(f"resources/images/targets/target_{idx}.png")
 
         predicted = {}
@@ -407,6 +409,7 @@ def run_classification(
             cls_generator = generators[cls_name]
 
             z_avg = models_ema[cls_name].mapping_network.get_average_w()
+            z_ = z_avg.clone().expand(test_bs, -1, -1).contiguous()
 
             with torch.no_grad():
 
@@ -426,7 +429,7 @@ def run_classification(
                 target_focal = estimated_focal 
                 assert target_w is not None
 
-                z_ = target_w
+                z_.data[:] = target_w
                 z_ = z_.mean(dim=1, keepdim=True)
 
             z_ /= cfg.inv.lr_gain_z
@@ -445,6 +448,8 @@ def run_classification(
             if z0_ is not None:
                 z0_.requires_grad_()
                 param_list = [z_, z0_, R_, s_, t2_]
+            if cfg.inv.no_optimize_pose:
+                param_list = param_list[:1]
 
             extra_model_inputs = {}
             optimizer = torch.optim.Adam(param_list, lr=2e-3, betas=(0.9, 0.95))
@@ -525,14 +530,9 @@ def run_classification(
                         'focal': focal
                     }
                 )
-                normal_map = None
                 loss = loss.sum()
                 psnr_monitor = psnr_monitor.mean()
                 lpips_monitor = lpips_monitor.mean()
-
-                if cfg.use_sdf and normal_map is not None:
-                    rgb_predicted = torch.cat(
-                        (rgb_predicted.detach(), normal_map.detach()), dim=-2)
 
                 loss.backward()
                 for i, param in enumerate(param_list):
@@ -555,17 +555,19 @@ def run_classification(
                 )
 
             target_img = target_img[..., :3]
-            predicted[train_split.class_to_id[cls_name]] = metrics.psnr(
+            predicted[train_eval_split.class_to_id[cls_name]] = metrics.psnr(
                 target_img / 2 + 0.5, rgb_predicted / 2 + 0.5
             )
 
             if save_images and idx % every_n_steps == 0:
                 Path(f"resources/images/{cls_name}").mkdir(parents=True, exist_ok=True)
                 plt.imshow(rgb_predicted[0].cpu().clamp(0, 1))
+                plt.axis("off")
                 plt.savefig(f"resources/images/{cls_name}/{cls_name}_{idx}.png")
         
         predict_cls = max(zip(predicted.values(), predicted.keys()))[1]
 
+        indexes.append(idx)
         target_classes.append(target_cls.cpu().item())
         predict_classes.append(predict_cls.cpu().item())
 
@@ -575,7 +577,7 @@ def run_classification(
             f'[{idx}/{len(image_indices)}] Finished batch in {t2-t1} s ({(t2-t1)/test_bs} s/img)'
         )
 
-    return target_classes, predict_classes
+    return target_classes, predict_classes, indexes
 
 def estimate_poses_batch(target_coords, target_mask, focal_guesses):
     target_mask = target_mask > 0.9
@@ -640,16 +642,18 @@ def main():
     encoders = load_encoders(cfg)
     models_ema, generators = load_generators(cfg)
     _, train_split, train_eval_split, test_split = imagenet_loader.load_dataset(cfg, DEVICE)
-    targets, predicts = run_classification(
+    targets, predicts, idxs = run_classification(
         cfg, encoders, models_ema, generators,
         train_split, train_eval_split, test_split,
-        save_images=True, every_n_steps=100
+        save_images=True, every_n_steps=1
     )
     Path("./resources/results").mkdir(parents=True, exist_ok=True)
     with open("./resources/results/targets.npy", 'wb') as f:
         np.save(f, np.array(targets))
     with open("./resources/results/predicts.npy", 'wb') as f:
         np.save(f, np.array(predicts))
+    with open("./resources/results/indexes.npy", 'wb') as f:
+        np.save(f, np.array(idxs))
 
 
 if __name__ == "__main__":
