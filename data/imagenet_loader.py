@@ -101,10 +101,10 @@ def load_custom(cfg, dataset_config, device):
     train_split.classes_id = torch.cat(all_classes_id, dim=0)
     train_split.classes = np.concatenate(all_classes, axis=0)
     train_split.num_classes = train_split.classes_id.max().item() + 1
-    for id_, class_ in zip(train_split.classes_id, train_split.classes):
-        if class_ not in train_split.class_to_id:
-            train_split.class_to_id[class_] = id_
-            train_split.id_to_class[id_] = class_
+    for class_, id_ in cfg.class_to_id_mapping.items():
+        id_ = torch.tensor(id_, dtype=torch.int8)
+        train_split.class_to_id[class_] = id_
+        train_split.id_to_class[id_] = class_
 
     train_eval_split.tform_cam2world = torch.cat(all_poses_fid, dim=0)
     train_eval_split.focal_length = torch.cat(all_focal_fid, dim=0).squeeze(1)
@@ -113,7 +113,7 @@ def load_custom(cfg, dataset_config, device):
     train_eval_split.classes = np.concatenate(all_classes_fid, axis=0)
     train_eval_split.num_classes = train_split.num_classes
     train_eval_split.class_to_id = train_split.class_to_id
-    train_eval_split.id_to_class = train_eval_split.id_to_class
+    train_eval_split.id_to_class = train_split.id_to_class
 
     return train_split, train_eval_split, test_split
 
