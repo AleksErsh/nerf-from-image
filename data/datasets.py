@@ -375,7 +375,7 @@ class CustomDataset(torch.utils.data.Dataset):
 
         # Multiply img with mask
         mask = mask[None, :, :]
-        #img = img * 2 - 1
+        img = img * 2 - 1
         if not self.debug_disable_mask:
             masked_img = mask * img
         masked_img = np.concatenate((masked_img, mask), axis=0)
