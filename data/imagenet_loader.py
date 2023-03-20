@@ -33,12 +33,14 @@ def load_custom(cfg, dataset_config, device):
     all_bbox = []
     all_classes_id = []
     all_classes = []
+    all_paths = []
 
     all_poses_fid = []
     all_focal_fid = []
     all_bbox_fid = []
     all_classes_id_fid = []
     all_classes_fid = []
+    all_paths_fid = []
 
     for imagenet_cls in cfg.dataset:
         dataset_inst = lambda *fn_args, **fn_kwargs: datasets.CustomDataset(
@@ -53,7 +55,7 @@ def load_custom(cfg, dataset_config, device):
                             add_mirrored=True)
         dataset_fid = dataset_inst('train',
                                 img_size=img_size,
-                                crop=True,
+                                crop=False,
                                 add_mirrored=False)
         loader = torch.utils.data.DataLoader(dataset,
                                             shuffle=False,
@@ -79,6 +81,7 @@ def load_custom(cfg, dataset_config, device):
             all_bbox.append(sample['normalized_bbox'])
             all_classes_id.append(sample['class_id'])
             all_classes.append(sample['class'])
+            all_paths.append(sample['path'])
 
         for _, sample in enumerate(tqdm(loader_fid)):
             all_images_fid.append(sample['img'].clamp(-1, 1).permute(0, 2, 3, 1))
@@ -87,6 +90,7 @@ def load_custom(cfg, dataset_config, device):
             all_bbox_fid.append(sample['normalized_bbox'])
             all_classes_id_fid.append(sample['class_id'])
             all_classes_fid.append(sample['class'])
+            all_paths_fid.append(sample['path'])
 
     train_split.images = torch.cat(all_images, dim=0)
     train_eval_split.images = torch.cat(all_images_fid, dim=0)
@@ -101,6 +105,7 @@ def load_custom(cfg, dataset_config, device):
     train_split.classes_id = torch.cat(all_classes_id, dim=0)
     train_split.classes = np.concatenate(all_classes, axis=0)
     train_split.num_classes = train_split.classes_id.max().item() + 1
+    train_split.paths = np.concatenate(all_paths, axis=0)
     for class_, id_ in cfg.class_to_id_mapping.items():
         id_ = torch.tensor(id_, dtype=torch.int8)
         train_split.class_to_id[class_] = id_
@@ -111,6 +116,7 @@ def load_custom(cfg, dataset_config, device):
     train_eval_split.bbox = torch.cat(all_bbox_fid, dim=0)
     train_eval_split.classes_id = torch.cat(all_classes_id_fid, dim=0)
     train_eval_split.classes = np.concatenate(all_classes_fid, axis=0)
+    train_eval_split.paths = np.concatenate(all_paths_fid, axis=0)
     train_eval_split.num_classes = train_split.num_classes
     train_eval_split.class_to_id = train_split.class_to_id
     train_eval_split.id_to_class = train_split.id_to_class
@@ -154,6 +160,7 @@ class DatasetSplit:
         self.classes_id = None
         self.classes = None
         self.num_classes = None
+        self.paths = None
         self.class_to_id = {}
         self.id_to_class = {}
 
@@ -163,3 +170,6 @@ class DatasetSplit:
 
     def __getitem__(self, idx):
         return DatasetSplitView(self, idx)
+    
+    def get_path(self, idx):
+        return self.paths[idx]
