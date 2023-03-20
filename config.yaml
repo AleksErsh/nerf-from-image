@@ -3,10 +3,10 @@ gpus: 1
 root_path: "."
 
 dataset:
-  - imagenet_airplane
   - imagenet_car
-  - imagenet_elephant
+  - imagenet_airplane
   - imagenet_motorcycle
+  - imagenet_elephant
   - imagenet_zebra
 class_to_id_mapping:
   car: 3
@@ -35,10 +35,10 @@ batch_size: 4
 
 rendering:
   depth_samples_per_ray: 64
-  randomize: True
+  randomize: False
   compute_normals: False
   compute_semantics: False
-  compute_coords: False
+  compute_coords: True
   extra_model_outputs: []
   extra_model_inputs: {}
   force_no_cam_grad: False
@@ -47,7 +47,7 @@ generator:
   resolution: 128
   use_ema: True
   res_multiplier: 1
-  ray_multiplier: 1
+  ray_multiplier: 4
   pretrain_sdf: False
   encoder_output: False
   use_encoder: False
@@ -58,24 +58,33 @@ encoder_weights_dir: coords_checkpoints
 generator_weights_dir: gan_checkpoints
 
 ImageNet:
-  airplane:
-    encoder_checkpoint_path: g_imagenet_airplane_pretrained/c_it300000_latest.pth
-    generator_checkpoint_path: g_imagenet_airplane_pretrained/checkpoint_latest.pth
   car:
     encoder_checkpoint_path: g_imagenet_car_pretrained/c_it300000_latest.pth
     generator_checkpoint_path: g_imagenet_car_pretrained/checkpoint_latest.pth
-  elephant:
-    encoder_checkpoint_path: g_imagenet_elephant_pretrained/c_it200000_latest.pth
-    generator_checkpoint_path: g_imagenet_elephant_pretrained/checkpoint_latest.pth
+  airplane:
+    encoder_checkpoint_path: g_imagenet_airplane_pretrained/c_it300000_latest.pth
+    generator_checkpoint_path: g_imagenet_airplane_pretrained/checkpoint_latest.pth
   motorcycle:
     encoder_checkpoint_path: g_imagenet_motorcycle_pretrained/c_it300000_latest.pth
     generator_checkpoint_path: g_imagenet_motorcycle_pretrained/checkpoint_latest.pth
+  elephant:
+    encoder_checkpoint_path: g_imagenet_elephant_pretrained/c_it200000_latest.pth
+    generator_checkpoint_path: g_imagenet_elephant_pretrained/checkpoint_latest.pth
   zebra:
-    encoder_checkpoint_path: g_imagenet_zebra_pretrained/c_it200000_latest.pth
+    encoder_checkpoint_path: g_imagenet_zebra_pretrained/c_it300000_latest.pth
     generator_checkpoint_path: g_imagenet_zebra_pretrained/checkpoint_latest.pth
 
 
 inv:
   no_optimize_pose: True
-  lr_gain_z: 25
+  lr_gain_z: 5
   loss: vgg
+  checkpoint_steps: 0
+  save_images: True
+  every_n_steps: 1
+
+artifacts:
+  targets_path: ./resources/results/targets.npy
+  predicts_path: ./resources/results/predicts.npy
+  indexes_path: ./resources/results/indexes.npy
+  images_path: ./resources/results/paths.npy
