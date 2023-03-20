@@ -25,6 +25,7 @@ from lib import fid
 from lib import ops
 from lib import metrics
 from lib import pose_estimation
+from lib import dino
 from models import generator
 from models import discriminator
 from models import encoder
@@ -96,7 +97,7 @@ def render(
         request_sampler_outputs.append('normals')
 
     if cfg.rendering.compute_semantics:
-        assert cfg.attention_values > 0
+        assert cfg.generator.attention_values > 0
         request_sampler_outputs.append('semantics')
 
     if cfg.rendering.compute_coords:
@@ -341,10 +342,10 @@ def create_generator(cfg):
 def run_classification(
     cfg, encoders, models_ema, generators,
     train_split, train_eval_split, test_split,
-    save_images: bool = False, every_n_steps: int = None
 ):
-    if save_images:
-        assert isinstance(every_n_steps, int)
+    feature_extractor = dino.ViTExtractor()
+    if cfg.inv.save_images:
+        assert isinstance(cfg.inv.every_n_steps, int)
 
     batch_size = 1
     test_bs = batch_size
@@ -365,11 +366,12 @@ def run_classification(
                                                 dim=0).sort()[0]
     image_indices = train_eval_split.eval_indices
 
-    checkpoint_steps = [0, 30]
+    checkpoint_steps = [0, cfg.inv.checkpoint_steps]
 
     idx = 0
 
     indexes = []
+    paths = []
     target_classes = []
     predict_classes = []
 
@@ -383,6 +385,7 @@ def run_classification(
 
         target_img = train_eval_split[target_img_idx].images
         target_cls = train_eval_split[target_img_idx].classes_id
+        target_path = train_eval_split.get_path(target_img_idx)
 
         # Target for evaluation
         target_img_fid_ = train_eval_split[
@@ -396,13 +399,21 @@ def run_classification(
 
         gt_cam2world_mat = target_tform_cam2world.clone()
 
-        if save_images and idx % every_n_steps == 0:
-            Path("resources/images/targets").mkdir(parents=True, exist_ok=True)
-            plt.imshow(target_img[0][:,:,:3].cpu())
-            plt.axis("off")
-            plt.savefig(f"resources/images/targets/target_{idx}.png")
+        target_img_for_dino = target_img[:,:,:,:3].permute(0, 3, 1, 2) / 2 + 0.5
+        target_img_for_dino = feature_extractor.normalize(target_img_for_dino)
+        target_features = feature_extractor.extract_descriptors(target_img_for_dino)
 
-        predicted = {}
+        if cfg.inv.save_images and idx % cfg.inv.every_n_steps == 0:
+            Path("resources/images/targets").mkdir(parents=True, exist_ok=True)
+            fig, ax = plt.subplots(nrows=1, ncols=1)
+            plt.imshow(target_img[0][:,:,:3].cpu() / 2 + 0.5)
+            plt.axis("off")
+            fig.savefig(f"resources/images/targets/target_{idx}.png")
+            plt.close(fig)
+
+        predicted_psnr_loss = []
+        predicted_features = []
+        predicted_class = []
         for cls_name in cfg.ImageNet:
 
             cls_encoder = encoders[cls_name]
@@ -441,18 +452,21 @@ def run_classification(
                 camera_flipped=cfg.dataset_config.camera_flipped
             )
             # Optimize pose
-            t2_.requires_grad_()
-            s_.requires_grad_()
-            R_.requires_grad_()
-            param_list = [z_, R_, s_, t2_]
+            if not cfg.inv.no_optimize_pose:
+                t2_.requires_grad_()
+                s_.requires_grad_()
+                R_.requires_grad_()
             if z0_ is not None:
-                z0_.requires_grad_()
+                if not cfg.inv.no_optimize_pose:
+                    z0_.requires_grad_()
                 param_list = [z_, z0_, R_, s_, t2_]
+            else:
+                param_list = [z_, R_, s_, t2_]
             if cfg.inv.no_optimize_pose:
                 param_list = param_list[:1]
 
             extra_model_inputs = {}
-            optimizer = torch.optim.Adam(param_list, lr=2e-3, betas=(0.9, 0.95))
+            optimizer = torch.optim.Adam(param_list, lr=2e-2, betas=(0.9, 0.95))
             grad_norms = []
             for _ in range(len(param_list)):
                 grad_norms.append([])
@@ -555,19 +569,39 @@ def run_classification(
                 )
 
             target_img = target_img[..., :3]
-            predicted[train_eval_split.class_to_id[cls_name]] = metrics.psnr(
-                target_img / 2 + 0.5, rgb_predicted / 2 + 0.5
-            )
 
-            if save_images and idx % every_n_steps == 0:
+            # Calculate psnr loss
+            predicted_psnr_loss.append(
+                metrics.psnr(target_img / 2 + 0.5, rgb_predicted / 2 + 0.5)
+            )
+            
+            # Calculate features using DINO
+            rgb_predicted_for_dino = rgb_predicted[:,:,:,:3].permute(0, 3, 1, 2) / 2 + 0.5
+            rgb_predicted_for_dino = feature_extractor.normalize(rgb_predicted_for_dino)
+            rgb_predicted_features = feature_extractor.extract_descriptors(rgb_predicted_for_dino)
+            predicted_features.append(rgb_predicted_features)
+
+            # Add class
+            predicted_class.append(cls_name)
+
+            # Save image
+            if cfg.inv.save_images and idx % cfg.inv.every_n_steps == 0:
                 Path(f"resources/images/{cls_name}").mkdir(parents=True, exist_ok=True)
-                plt.imshow(rgb_predicted[0].cpu().clamp(0, 1))
+                fig, ax = plt.subplots(nrows=1, ncols=1)
+                plt.imshow(rgb_predicted[0].cpu().clamp(-1, 1) / 2 + 0.5)
                 plt.axis("off")
                 plt.savefig(f"resources/images/{cls_name}/{cls_name}_{idx}.png")
+                plt.close(fig)
         
-        predict_cls = max(zip(predicted.values(), predicted.keys()))[1]
-
+        predicted_features = torch.cat(predicted_features)
+        cos_sim = chunk_cosine_sim(target_features, predicted_features)[0]
+        predict_cls = train_eval_split.class_to_id[
+            predicted_class[torch.argmax(cos_sim).item()]
+        ]
+        #predict_cls = max(zip(predicted_psnr_loss, predicted_class))[1]
+        
         indexes.append(idx)
+        paths.append(target_path)
         target_classes.append(target_cls.cpu().item())
         predict_classes.append(predict_cls.cpu().item())
 
@@ -577,7 +611,7 @@ def run_classification(
             f'[{idx}/{len(image_indices)}] Finished batch in {t2-t1} s ({(t2-t1)/test_bs} s/img)'
         )
 
-    return target_classes, predict_classes, indexes
+    return target_classes, predict_classes, indexes, paths
 
 def estimate_poses_batch(target_coords, target_mask, focal_guesses):
     target_mask = target_mask > 0.9
@@ -642,10 +676,9 @@ def main():
     encoders = load_encoders(cfg)
     models_ema, generators = load_generators(cfg)
     _, train_split, train_eval_split, test_split = imagenet_loader.load_dataset(cfg, DEVICE)
-    targets, predicts, idxs = run_classification(
+    targets, predicts, idxs, paths = run_classification(
         cfg, encoders, models_ema, generators,
         train_split, train_eval_split, test_split,
-        save_images=True, every_n_steps=1
     )
     Path("./resources/results").mkdir(parents=True, exist_ok=True)
     with open("./resources/results/targets.npy", 'wb') as f:
@@ -654,7 +687,23 @@ def main():
         np.save(f, np.array(predicts))
     with open("./resources/results/indexes.npy", 'wb') as f:
         np.save(f, np.array(idxs))
+    with open("./resources/results/paths.npy", 'wb') as f:
+        np.save(f, np.array(paths))
 
+def chunk_cosine_sim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """ Computes cosine similarity between all possible pairs in two sets of vectors.
+    Operates on chunks so no large amount of GPU RAM is required.
+    :param x: an tensor of descriptors of shape (B_x)x1xtxd' where d' is the dimensionality of the descriptors and t
+    is the number of tokens.
+    :param y: a tensor of descriptors of shape (B_y)x1xtxd' where d' is the dimensionality of the descriptors and t
+    is the number of tokens.
+    :return: cosine similarity between all vectors in x and all vectors in y. Has shape of (B_x)x(B_y) """
+    x = x.reshape(x.shape[0], -1)
+    y = y.reshape(y.shape[0], -1)
+    x_norm = x / x.norm(dim=1)[:, None]
+    y_norm = y / y.norm(dim=1)[:, None]
+    res = torch.mm(x_norm, y_norm.transpose(0,1))
+    return res
 
 if __name__ == "__main__":
     main()
