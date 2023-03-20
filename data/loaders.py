@@ -128,6 +128,7 @@ def get_dataset_loaders():
         'shapenet_cars': load_shapenet,
         'shapenet_chairs': load_shapenet,
         'p3d_car': load_custom,
+        'p3d_aeroplane': load_custom,
         'cub': load_custom,
         'carla': load_carla,
         'imagenet_car': load_custom,
@@ -243,7 +244,7 @@ def load_custom(dataset_config, args, device):
 
     if dataset_config['views_per_object_test'] and (args.use_encoder or
                                                     args.run_inversion):
-        if args.dataset == 'p3d_car' and args.inv_use_imagenet_testset:
+        if args.dataset in ['p3d_car', 'p3d_aeroplane'] and args.inv_use_imagenet_testset:
             test_split = 'imagenet_test'
         else:
             test_split = 'test'

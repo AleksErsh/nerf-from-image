@@ -60,7 +60,7 @@ experiment_name = arguments.suggest_experiment_name(args)
 resume_from = None
 log_dir = 'gan_logs'
 report_dir = 'reports'
-file_dir = 'gan_checkpoints'
+file_dir = '/local/nerf-from-image/gan_checkpoints'
 
 checkpoint_dir = os.path.join(args.root_path, file_dir, experiment_name)
 if not args.run_inversion:
@@ -86,7 +86,7 @@ if args.resume_from:
     if '.pth' in args.resume_from:
         # Load specified filename
         print('Attempting to load specified checkpoint (filename)...')
-        last_checkpoint_dir = os.path.join(args.root_path, 'gan_checkpoints',
+        last_checkpoint_dir = os.path.join(args.root_path, '/local/nerf-from-image/gan_checkpoints',
                                            args.resume_from)
         # Strip filename from checkpoint dir
         args.resume_from = os.path.dirname(args.resume_from)
@@ -95,13 +95,13 @@ if args.resume_from:
         print(
             f'Attempting to load specified checkpoint (iteration {checkpoint_iter})...'
         )
-        last_checkpoint_dir = os.path.join(args.root_path, 'gan_checkpoints',
+        last_checkpoint_dir = os.path.join(args.root_path, '/local/nerf-from-image/gan_checkpoints',
                                            args.resume_from,
                                            f'checkpoint_{checkpoint_iter}.pth')
     else:
         # Load latest
         print('Attempting to load latest checkpoint...')
-        last_checkpoint_dir = os.path.join(args.root_path, 'gan_checkpoints',
+        last_checkpoint_dir = os.path.join(args.root_path, '/local/nerf-from-image/gan_checkpoints',
                                            args.resume_from,
                                            'checkpoint_latest.pth')
 
@@ -1728,7 +1728,7 @@ if args.run_inversion:
 
     batch_size = args.batch_size // 4 * len(gpu_ids)
 
-    if args.dataset == 'p3d_car' and use_testset:
+    if args.dataset in ['p3d_car', 'p3d_aeroplane'] and use_testset:
         split_str = 'imagenettest' if args.inv_use_imagenet_testset else 'test'
     else:
         split_str = 'test' if use_testset else 'train'
@@ -2026,7 +2026,7 @@ if args.run_inversion:
                 torch.FloatTensor(
                     fid.forward_inception_batch(
                         inception_net, rgb_predicted_perm[:, :3] / 2 + 0.5)))
-            if not (args.dataset == 'p3d_car' and use_testset):
+            if not (args.dataset in ['p3d_car', 'p3d_aeroplane'] and use_testset):
                 # Ground-truth poses are not available on P3D Car (test set)
                 item['rot_error'].append(
                     pose_utils.rotation_matrix_distance(cam, gt_cam2world_mat))

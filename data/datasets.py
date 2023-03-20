@@ -53,9 +53,12 @@ class CustomDataset(torch.utils.data.Dataset):
             assert split == 'train', 'ImageNet does not have a test split!'
 
         if split == 'test':
-            assert dataset == 'p3d_car'
+            assert dataset in ['p3d_car', 'p3d_aeroplane']
             p3d_anno_path = os.path.join(root_dir, 'p3d', 'p3d_sfm_image')
-            anno_path = os.path.join(p3d_anno_path, 'img_anno', 'car_val.mat')
+            if dataset == 'p3d_car':
+                anno_path = os.path.join(p3d_anno_path, 'img_anno', 'car_val.mat')
+            elif dataset == 'p3d_aeroplane':
+                anno_path = os.path.join(p3d_anno_path, 'img_anno', 'aeroplane_val.mat')
             val_images = scipy.io.loadmat(anno_path,
                                           struct_as_record=False,
                                           squeeze_me=True)['images']
